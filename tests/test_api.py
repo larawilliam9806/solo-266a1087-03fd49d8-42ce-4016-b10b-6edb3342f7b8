@@ -391,3 +391,274 @@ def test_concurrent_reads_during_compaction_are_consistent(tmp_path):
         for t in threads:
             t.join()
         assert not errors, errors
+
+
+# ---------------------------------------------------------------------------
+# hourly summaries
+# ---------------------------------------------------------------------------
+
+def hourly(client: TestClient, day: str = DAY) -> list[dict]:
+    r = client.get(f"/days/{day}/hourly")
+    assert r.status_code == 200, r.text
+    return r.json()["buoys"]
+
+
+def as_map(buoys: list[dict]) -> dict:
+    return {(b["buoy_id"], b["hour_utc"]): (b["observation_count"], b["mean_salinity"])
+            for b in buoys}
+
+
+def expected_hourly(rows: list[tuple[str, str, float]]) -> dict:
+    """Reference implementation: plain Python over the raw observations."""
+    acc: dict[tuple[str, str], list[float]] = {}
+    for buoy, ts, sal in rows:
+        hour = ts[:13] + ":00:00Z"
+        acc.setdefault((buoy, hour), []).append(sal)
+    return {k: (len(v), sum(v) / len(v)) for k, v in acc.items()}
+
+
+def records_as_rows(client: TestClient, day: str = DAY) -> list[tuple[str, str, float]]:
+    body = client.get(f"/days/{day}/records").json()
+    return [(r["buoy_id"], r["ts_utc"], r["salinity"]) for r in body["records"]]
+
+
+def test_hourly_groups_by_buoy_and_hour_counting_duplicates(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)     # 00:01, 00:02
+        upload(c, CSV_B)     # 01:01, 01:02
+        upload(c, CSV_DUP)   # 03:00 x2 identical rows
+        upload(c, CSV_DUP)   # ... twice
+
+        got = as_map(hourly(c))
+        assert got == expected_hourly(records_as_rows(c))
+        assert got[("B009", "2026-11-18T03:00:00Z")] == (4, 33.3)
+
+
+def test_hourly_averages_within_hour(tmp_path):
+    csv_text = (
+        "buoy_id,ts_utc,salinity\n"
+        "B1,2026-11-18T05:00:00Z,30\n"
+        "B1,2026-11-18T05:59:59Z,34\n"
+        "B1,2026-11-18T06:00:00Z,40\n"
+        "B2,2026-11-18T05:30:00Z,10\n"
+    )
+    with make_client(tmp_path) as c:
+        upload(c, csv_text)
+        got = as_map(hourly(c))
+        assert got[("B1", "2026-11-18T05:00:00Z")] == (2, 32.0)
+        assert got[("B1", "2026-11-18T06:00:00Z")] == (1, 40.0)
+        assert got[("B2", "2026-11-18T05:00:00Z")] == (1, 10.0)
+        assert len(got) == 3
+
+
+def test_hourly_empty_day(tmp_path):
+    with make_client(tmp_path) as c:
+        body = c.get(f"/days/{DAY}/hourly").json()
+        assert body["day"] == DAY and body["buoys"] == []
+
+
+def test_hourly_does_not_rescan_raw_files(tmp_path, monkeypatch):
+    import app.lake as lake_mod
+
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        first = as_map(hourly(c))
+
+        calls = []
+        real = lake_mod.pq.read_table
+        monkeypatch.setattr(lake_mod.pq, "read_table", lambda *a, **k: calls.append(a) or real(*a, **k))
+        second = as_map(hourly(c))
+        assert second == first
+        assert calls == [], f"raw parquet rescanned: {calls}"
+
+
+def test_hourly_backfills_files_registered_before_feature(tmp_path):
+    """Files already on disk (legacy rows, materialized=0) are backfilled once."""
+    import app.lake as lake_mod
+
+    data_dir = tmp_path / "data"
+    lake1 = Lake(str(data_dir))
+    lake1.upload(DAY, CSV_A.encode())
+    lake1.upload(DAY, CSV_B.encode())
+    # Simulate a database written by the previous release: no buckets yet.
+    with connect(str(lake1.db_path)) as conn:
+        conn.execute("DELETE FROM file_hours")
+        conn.execute("UPDATE files SET materialized = 0")
+        conn.execute("DELETE FROM hourly_summaries")
+    del lake1
+
+    with make_client(tmp_path) as c:
+        got = as_map(hourly(c))
+        assert got == expected_hourly(records_as_rows(c))
+        assert len(got) == 4
+
+        calls = []
+        real = lake_mod.pq.read_table
+        monkeypatched = lambda *a, **k: calls.append(a) or real(*a, **k)
+        import unittest.mock as mock
+        with mock.patch.object(lake_mod.pq, "read_table", monkeypatched):
+            hourly(c)
+        assert calls == []  # backfilled once, never again
+
+
+def test_hourly_matches_records_across_compaction(tmp_path):
+    with make_client(tmp_path, compaction_delay_sec=0.4) as c:
+        for csv in (CSV_A, CSV_B, CSV_DUP):
+            upload(c, csv)
+        before = as_map(hourly(c))
+
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        upload(c, CSV_C)  # appended while compaction runs
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+
+        after = as_map(hourly(c))
+        assert after == expected_hourly(records_as_rows(c))
+        assert after != before
+        # observations from the compacted inputs are neither dropped nor doubled
+        assert after[("B009", "2026-11-18T03:00:00Z")] == (2, 33.3)
+        assert sum(n for n, _ in after.values()) == c.get(f"/days/{DAY}/records").json()["row_count"]
+
+
+def test_compaction_does_not_double_count(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+
+        got = as_map(hourly(c))
+        assert got == expected_hourly(records_as_rows(c))
+        assert sum(n for n, _ in got.values()) == 4
+
+        # compact again (single input) -- still no double counting
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        assert as_map(hourly(c)) == got
+
+
+def test_hourly_persisted_across_restart(tmp_path):
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        expected = as_map(hourly(c))
+
+    with make_client(tmp_path) as c:
+        assert as_map(hourly(c)) == expected
+        assert c.get(f"/days/{DAY}/records").json()["row_count"] == 4
+
+
+def test_upload_and_hourly_are_atomic(tmp_path, monkeypatch):
+    """If persisting the hourly buckets fails, the upload is not registered."""
+    import app.lake as lake_mod
+
+    with make_client(tmp_path) as c:
+        upload(c, CSV_A)
+        lake = c.app.state.lake
+        monkeypatch.setattr(
+            lake_mod.Lake, "_store_buckets",
+            staticmethod(lambda *a, **k: (_ for _ in ()).throw(OSError("db down (simulated)"))),
+        )
+        with pytest.raises(OSError):
+            lake.upload(DAY, CSV_B.encode())
+
+        # registry unchanged and no orphan bytes left behind
+        body = c.get(f"/days/{DAY}/records").json()
+        assert body["row_count"] == 2 and body["file_count"] == 1
+        assert as_map(hourly(c)) == expected_hourly(records_as_rows(c))
+        day_dir = tmp_path / "data" / f"dt={DAY}"
+        assert len(list(day_dir.glob("part-*.parquet"))) == 1
+
+
+def test_hourly_consistent_during_compaction(tmp_path):
+    """Concurrent hourly queries only ever see complete states."""
+    with make_client(tmp_path, compaction_delay_sec=0.5) as c:
+        upload(c, CSV_A)
+        upload(c, CSV_B)
+        upload(c, CSV_C)
+
+        expected = expected_hourly(records_as_rows(c))
+        total = sum(n for n, _ in expected.values())
+        job_id = c.post(f"/days/{DAY}/compactions").json()["job_id"]
+
+        errors = []
+        seen = []
+        def reader():
+            try:
+                while not done.is_set():
+                    got = as_map(hourly(c))
+                    assert got == expected, got
+                    assert sum(n for n, _ in got.values()) == total
+                    seen.append(len(got))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        done = threading.Event()
+        threads = [threading.Thread(target=reader) for _ in range(3)]
+        for t in threads:
+            t.start()
+        assert wait_job(c, DAY, job_id)["status"] == "done"
+        time.sleep(0.2)
+        done.set()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+        assert seen
+
+
+def test_hourly_survives_crash_between_upload_and_aggregate(tmp_path):
+    """Booting a DB whose files lack buckets backfills before serving."""
+    data_dir = tmp_path / "data"
+    lake1 = Lake(str(data_dir))
+    lake1.upload(DAY, CSV_A.encode())
+    lake1.upload(DAY, CSV_B.encode())
+    # simulate a process that died before the (atomic) hourly work ran, as an
+    # older release would have left it
+    with connect(str(lake1.db_path)) as conn:
+        conn.execute("DELETE FROM file_hours")
+        conn.execute("DELETE FROM hourly_summaries")
+        conn.execute("UPDATE files SET materialized = 0")
+    del lake1
+
+    with make_client(tmp_path) as c:
+        assert c.app.state.recovery["days_backfilled"] == 1
+        assert as_map(hourly(c)) == expected_hourly(records_as_rows(c))
+        # and it is persisted: another restart does not rescan
+        with connect(str(data_dir / "lake_meta.db")) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM file_hours").fetchone()[0] > 0
+            assert conn.execute(
+                "SELECT COUNT(*) FROM files WHERE materialized = 0"
+            ).fetchone()[0] == 0
+
+
+def test_hourly_total_equals_record_count_with_concurrent_uploads(tmp_path):
+    with make_client(tmp_path) as c:
+        lake = c.app.state.lake
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(15):
+                    lake.upload(DAY, f"B{n}{i % 3},{DAY}T0{i % 10}:00:00Z,{30 + i % 5}\n".encode())
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def querier():
+            try:
+                for _ in range(30):
+                    hourly(c)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(3)]
+        threads += [threading.Thread(target=querier) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, errors
+
+        body = c.get(f"/days/{DAY}/records").json()
+        got = as_map(hourly(c))
+        assert sum(n for n, _ in got.values()) == body["row_count"] == 45
+        assert got == expected_hourly(records_as_rows(c))

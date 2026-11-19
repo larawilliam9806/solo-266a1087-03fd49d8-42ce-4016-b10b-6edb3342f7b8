@@ -4,6 +4,7 @@ Endpoints
 ---------
 POST   /days/{day}/upload                 append a CSV as one parquet file
 GET    /days/{day}/records                all records (consistent snapshot)
+GET    /days/{day}/hourly                 per-buoy, per-UTC-hour summary
 GET    /days/{day}/files                  active file list / count
 POST   /days/{day}/compactions            start background compaction (202)
 GET    /days/{day}/compactions            list jobs for the day
@@ -91,6 +92,7 @@ def create_app(
             "endpoints": [
                 "POST /days/{day}/upload",
                 "GET /days/{day}/records",
+                "GET /days/{day}/hourly",
                 "GET /days/{day}/files",
                 "POST /days/{day}/compactions",
                 "GET /days/{day}/compactions",
@@ -115,6 +117,24 @@ def create_app(
     def records(day: str, request: Request):
         """All records for the day from one consistent snapshot + file count."""
         return lake(request).read_day(_valid_day(day))
+
+    def hourly_payload(day: str, request: Request):
+        return lake(request).hourly_summary(_valid_day(day))
+
+    @app.get("/days/{day}/hourly")
+    def hourly(day: str, request: Request):
+        """Per-buoy, per-UTC-hour observation count and mean salinity.
+
+        Duplicate observations count individually.  The first call for a day
+        backfills aggregates for its already-registered files; later calls are
+        served from persisted aggregates without rescanning parquet.
+        """
+        return hourly_payload(day, request)
+
+    @app.get("/days/{day}/hourly-summary", include_in_schema=False)
+    def hourly_summary(day: str, request: Request):
+        """Alias of ``GET /days/{day}/hourly``."""
+        return hourly_payload(day, request)
 
     @app.get("/days/{day}/files")
     def files(day: str, request: Request):

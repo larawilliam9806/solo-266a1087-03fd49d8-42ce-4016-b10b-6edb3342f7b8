@@ -6,11 +6,21 @@ Two tables:
                      partition.  ``state`` is ``active`` (visible to readers)
                      or ``retired`` (replaced by compaction, waiting for
                      in-flight readers to drain before the bytes are
-                     unlinked).
+                     unlinked).  ``materialized`` records whether the file's
+                     hourly buckets have been persisted.
 * ``compactions`` -- one row per compaction job.  A partial unique index
                      guarantees at most one ``running`` job per day, which is
                      what lets us reject concurrent compactions for the same
                      day atomically (even across a process restart).
+* ``file_hours``  -- per-file UTC hourly buckets (``obs_count``, salinity
+                     ``sal_sum``), written in the *same transaction* that
+                     registers or retires the file, so no file is ever
+                     counted twice and no observation is ever dropped by a
+                     compaction switch.
+* ``hourly_summaries``
+                     -- the last completed aggregate per day plus its
+                     row/bucket counts, used to skip recomputation and only
+                     trusted while it matches the current per-file buckets.
 
 The compaction *switch* (retire inputs + register output + mark job done)
 happens in a single SQLite transaction, so a crash can never leave the
@@ -29,7 +39,10 @@ CREATE TABLE IF NOT EXISTS files (
     kind       TEXT NOT NULL CHECK (kind IN ('upload', 'compacted')),
     state      TEXT NOT NULL CHECK (state IN ('active', 'retired')),
     rows       INTEGER NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- 1 once this file's rows have been reduced to ``file_hours`` buckets;
+    -- 0 only for files that predate hourly summaries / crashed backfills.
+    materialized INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_files_day_state ON files(day, state);
 
@@ -48,6 +61,25 @@ CREATE TABLE IF NOT EXISTS compactions (
 -- At most one running compaction per day (enforced by the DB itself).
 CREATE UNIQUE INDEX IF NOT EXISTS ux_compactions_one_running_per_day
     ON compactions(day) WHERE status = 'running';
+
+-- Hourly buckets for one parquet file, keyed by the file registry path.
+CREATE TABLE IF NOT EXISTS file_hours (
+    path       TEXT NOT NULL,
+    buoy_id    TEXT NOT NULL,
+    hour_utc   TEXT NOT NULL,           -- YYYY-MM-DDTHH:00:00Z
+    obs_count  INTEGER NOT NULL,
+    sal_sum    REAL NOT NULL,
+    PRIMARY KEY (path, buoy_id, hour_utc)
+);
+
+-- Completed day summaries.  Inserted only once every active file of the day
+-- has its buckets, in the same transaction, so readers never see partials.
+CREATE TABLE IF NOT EXISTS hourly_summaries (
+    day          TEXT PRIMARY KEY,
+    row_count    INTEGER NOT NULL,     -- observations counted (duplicates included)
+    bucket_count INTEGER NOT NULL,     -- distinct (buoy, hour) buckets
+    computed_at  TEXT NOT NULL
+);
 """
 
 
@@ -66,6 +98,21 @@ def init_schema(db_path: str) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a database created by an older version up to the current schema.
+
+    Adding ``files.materialized`` is the only migration so far.  Existing
+    files default to 0, i.e. their hourly buckets are backfilled lazily on
+    the first hourly query for their day.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)").fetchall()}
+    if "materialized" not in cols:
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN materialized INTEGER NOT NULL DEFAULT 0"
+        )

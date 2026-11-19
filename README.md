@@ -2,7 +2,9 @@
 
 单进程浮标数据湖 API：按 UTC 日分区追加上传 CSV（浮标号、UTC 时刻、盐度），
 每次上传落为一个 Parquet 文件；支持按日读取全部记录与当前文件数；支持按日
-触发后台压实，把启动时已有的若干小文件合并为一份，降低下游扫描的小文件开销。
+触发后台压实，把启动时已有的若干小文件合并为一份，降低下游扫描的小文件开销；
+提供持久化的按 UTC 小时汇总（观测条数 + 平均盐度），下游无需反复扫描整日
+Parquet。
 
 技术栈：FastAPI + PyArrow + SQLite（WAL），单进程设计。
 
@@ -37,6 +39,7 @@ python -m pytest tests/ -q
 |---|---|---|
 | POST | `/days/{day}/upload` | 上传 CSV（multipart 文件或 `text/csv` 原始 body），追加为一个 Parquet |
 | GET | `/days/{day}/records` | 读取当日全部记录（一致快照），含 `file_count`/`row_count` |
+| GET | `/days/{day}/hourly` | 小时汇总：各浮标每个 UTC 小时的观测条数与平均盐度 |
 | GET | `/days/{day}/files` | 当日活跃文件清单与文件数 |
 | POST | `/days/{day}/compactions` | 启动后台压实（202）；当日已有压实进行中返回 409 |
 | GET | `/days/{day}/compactions` | 当日压实任务列表 |
@@ -58,10 +61,38 @@ curl -X POST -H "Content-Type: text/csv" --data-binary @obs.csv \
 # 读取全部记录与文件数
 curl http://localhost:8000/days/2026-11-18/records
 
+# 小时汇总（各浮标每个 UTC 小时的观测条数 + 平均盐度）
+curl http://localhost:8000/days/2026-11-18/hourly
+
 # 启动压实并轮询状态
 curl -X POST http://localhost:8000/days/2026-11-18/compactions
 curl http://localhost:8000/days/2026-11-18/compactions/1
 ```
+
+### 小时汇总
+
+```json
+{
+  "day": "2026-11-18",
+  "buoys": [
+    {"buoy_id": "B001", "hour_utc": "2026-11-18T00:00:00Z", "observation_count": 2, "mean_salinity": 35.15},
+    {"buoy_id": "B002", "hour_utc": "2026-11-18T00:00:00Z", "observation_count": 1, "mean_salinity": 35.2}
+  ]
+}
+```
+
+- 按 `(buoy_id, UTC 小时)` 分组；`observation_count` 统计**每一行**观测，
+  完全重复的行也逐条计数；`mean_salinity` 为该桶内盐度算术平均。
+- 首次查询某日时，为该日**已有活跃文件**回填汇总；之后直接读持久化的
+  汇总，不再扫描原始 Parquet。旧版本遗留、尚无汇总的文件也会在这一步
+  或启动时一次性补齐。
+- 汇总持久化在 SQLite（`file_hours` + `hourly_summaries`）中，进程重启后
+  依然有效。
+- 查询始终返回与「某一完整已登记文件集合」相符的结果：上传登记与小时统计
+  在同一事务提交（要么都成功、要么都失败），压实切换与输入/输出文件的
+  统计更新也在同一事务提交，因此不会漏算、重复计数或返回部分汇总。
+- 回填期间上传与压实照常进行；若查询期间恰好有新文件登记，查询会重试而
+  不是返回缺失该文件的旧汇总。
 
 ## 一致性与可靠性设计
 
@@ -88,12 +119,19 @@ curl http://localhost:8000/days/2026-11-18/compactions/1
 - **旧文件回收**：退役文件仅在在途读取引用计数归零后才 unlink；回收只针对
   登记表中 `retired` 的文件，`active` 文件（包括压实期间新追加的）永远不会
   被误删。另有后台周期清扫兜底。
+- **小时汇总一致性**：每个 Parquet 文件在登记（上传）或产出（压实）时，用
+  同一份内存表算出逐文件小时桶，并与登记/切换在**同一个 SQLite 事务**中
+  提交；退役文件的行在同一事务中删除。因此压实只是把观测从若干输入文件
+  搬到一份输出文件，逐文件桶之和始终等于逐行重扫的结果，不会漏算或重复。
+  汇总查询在单个 `BEGIN IMMEDIATE` 事务内完成，只会看到完整的切换前或切换后
+  状态；缓存汇总仅在行数/桶数与当前逐文件桶完全一致时复用，否则重算并落库。
 
 ## 目录布局
 
 ```
 data/
-  lake_meta.db                 # SQLite 元数据（files 登记表 + compactions 任务表）
+  lake_meta.db                 # SQLite 元数据（files 登记表 + compactions 任务表
+                               #   + file_hours 逐文件小时桶 + hourly_summaries 汇总）
   dt=2026-11-18/
     part-<uuid>.parquet        # 上传产生的文件
     compacted-<job>-<id>.parquet  # 压实输出
